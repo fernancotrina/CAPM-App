@@ -13,7 +13,7 @@ st.set_page_config(
 )
 
 #########################
-# Encabezado Mejorado
+# Encabezado
 #########################
 
 st.markdown("""
@@ -58,7 +58,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 #########################
-# Sidebar - Inputs
+# Inputs
 #########################
 
 st.sidebar.header("⚙️ Configuración del Análisis")
