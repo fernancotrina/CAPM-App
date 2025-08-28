@@ -193,7 +193,7 @@ if st.sidebar.button("🚀 Ejecutar Análisis CAPM", type="primary"):
                 labels={'x': 'Activo', 'y': 'Beta'},
                 title="Betas CAPM por Activo",
                 color=results_df['beta'],
-                color_continuous_scale='RdYlGn'
+                color_continuous_scale=["green", "yellow", "red"]  # Verde bajo, amarillo medio, rojo alto
             )
             st.plotly_chart(fig_beta, use_container_width=True)
             
