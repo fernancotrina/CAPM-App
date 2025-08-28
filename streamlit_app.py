@@ -281,7 +281,7 @@ st.markdown("""
         <br>
         <a href="https://www.linkedin.com/in/fcotrina/" target="_blank" class="author-link-simple">
             <img src="https://cdn-icons-png.flaticon.com/512/174/174857.png" class="linkedin-icon-simple">
-            José Cotrina Lejabo
+            Fernando Cotrina
         </a>
     </div>
 """, unsafe_allow_html=True)
