@@ -99,7 +99,7 @@ risk_free_rate = st.sidebar.number_input("Tasa Libre de Riesgo (r)", value=0.02,
 start = st.sidebar.date_input('Fecha de inicio', value=pd.to_datetime('2020-01-01'))
 end = st.sidebar.date_input('Fecha de fin', value=pd.to_datetime('today'))
 
-return_method = st.sidebar.radio("Método de cálculo de retornos", ["log"], index=0)
+return_method = st.sidebar.radio("Método de cálculo de retornos", ["log", ""], index=0)
 
 #########################
 # Procesamiento Principal
@@ -256,7 +256,7 @@ else:
         **📋 Pasos:**
         1. Ingresa los tickers separados por espacio
         2. Selecciona el índice de mercado de referencia
-        3. Configura tasa libre de riesgo y prima de mercado
+        3. Configura tasa libre de riesgo
         4. Selecciona el rango de fechas
         5. Haz clic en 'Ejecutar Análisis CAPM'
         """)
