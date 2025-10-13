@@ -1,223 +1,162 @@
-# Import libraries
-from __future__ import annotations
 import pandas as pd
 import numpy as np
 import statsmodels.api as sm
-import matplotlib.pyplot as plt
-from dataclasses import dataclass
-from typing import Dict, Iterable, Optional, Tuple
-
-def fetch_prices_yf(tickers: Iterable[str], start: str, end: str, auto_adjust: bool = True) -> pd.DataFrame:
-    """Descarga precios de yfinance. Devuelve DataFrame (fecha x ticker) de Close ajustado.
-    Requiere internet en TU entorno (no en este editor).
-    """
-    try:
-        import yfinance as yf
-    except ImportError as e:
-        raise ImportError("Falta yfinance. Instala con: pip install yfinance") from e
-
-    data = yf.download(list(tickers), start=start, end=end, auto_adjust=auto_adjust, progress=False)
-    # Estructura: columnas multiíndice (Adj Close, ...). Tomamos Close/Adj Close
-    if isinstance(data.columns, pd.MultiIndex):
-        # Prioridad a 'Adj Close' si existe; si no, 'Close'
-        if ('Adj Close' in data.columns.get_level_values(0)):
-            px = data['Adj Close']
-        else:
-            px = data['Close']
-    else:
-        px = data
-    return px.dropna(how='all')
-
-
-def read_prices_csv(path: str, date_col: str = 'Date') -> pd.DataFrame:
-    """Lee un CSV con columna de fechas y columnas una por ticker.
-    El archivo debe tener formato wide: filas=fecha, columnas=tickers.
-    """
-    df = pd.read_csv(path)
-    df[date_col] = pd.to_datetime(df[date_col])
-    df = df.set_index(date_col).sort_index()
-    return df
-
-
-def to_periodic_returns(prices: pd.DataFrame, method: str = 'log') -> pd.DataFrame:
-    """Convierte precios a retornos (porcentaje). method: 'simple' o 'log'."""
-    prices = prices.sort_index()
-    if method == 'simple':
-        rets = prices.pct_change()
-    elif method == 'log':
-        rets = np.log(prices).diff()
-    else:
-        raise ValueError("method debe ser 'simple' o 'log'")
-    return rets.dropna(how='all')
-
-
-def align_inputs(assets_ret: pd.DataFrame, mkt_ret: pd.Series, rf: Optional[pd.Series | float]) -> Tuple[pd.DataFrame, pd.Series, pd.Series]:
-    """Alinea activos, mercado y rf en el mismo índice temporal.
-    Si rf es float, crea una Serie constante (misma frecuencia del mercado)."""
-    idx = assets_ret.index
-    mkt_ret = pd.Series(mkt_ret, index=mkt_ret.index).dropna()
-    common_idx = idx.intersection(mkt_ret.index)
-    A = assets_ret.loc[common_idx]
-    M = mkt_ret.loc[common_idx]
-
-    if rf is None:
-        rf_series = pd.Series(0.0, index=common_idx)
-    elif isinstance(rf, (int, float)):
-        rf_series = pd.Series(float(rf), index=common_idx)
-    else:
-        rf_series = pd.Series(rf, index=pd.Series(rf).index).dropna()
-        rf_series = rf_series.loc[common_idx]
-    return A, M, rf_series
-
-# =============================
-# Estimación CAPM
-# =============================
-
-@dataclass
-class CAPMResult:
-    alpha: float
-    beta: float
-    alpha_t: float
-    beta_t: float
-    r2: float
-    n: int
-
-
-def fit_capm_ols(asset_excess: pd.Series, mkt_excess: pd.Series) -> CAPMResult:
-    """Regresión OLS: Ri - rf = α + β (Rm - rf) + ε"""
-    df = pd.concat({'y': asset_excess, 'x': mkt_excess}, axis=1).dropna()
-    if df.empty:
-        raise ValueError("No hay datos comunes para estimar CAPM")
-    X = sm.add_constant(df['x'])
-    y = df['y']
-    model = sm.OLS(y, X, missing='drop').fit()
-    alpha = model.params.get('const', np.nan)
-    beta = model.params.get('x', np.nan)
-    alpha_t = model.tvalues.get('const', np.nan)
-    beta_t = model.tvalues.get('x', np.nan)
-    r2 = model.rsquared
-    n = int(model.nobs)
-    return CAPMResult(alpha, beta, alpha_t, beta_t, r2, n)
-
-
-def fit_capm_all(assets_ret: pd.DataFrame, mkt_ret: pd.Series, rf: Optional[pd.Series | float] = 0.0) -> pd.DataFrame:
-    """Ajusta CAPM para cada activo. Devuelve DataFrame con α, β, t-stats, R², n."""
-    A, M, RF = align_inputs(assets_ret, mkt_ret, rf)
-    mkt_excess = M - RF
-    out = []
-    for col in A.columns:
-        res = fit_capm_ols(A[col] - RF, mkt_excess)
-        out.append({
-            'asset': col,
-            'alpha': res.alpha,
-            'beta': res.beta,
-            'alpha_t': res.alpha_t,
-            'beta_t': res.beta_t,
-            'r2': res.r2,
-            'n': res.n,
-        })
-    return pd.DataFrame(out).set_index('asset')
-
-
-def rolling_beta(asset_ret: pd.Series, mkt_ret: pd.Series, rf: Optional[pd.Series | float] = 0.0, window: int = 60) -> pd.Series:
-    """β rolling con ventana (p.ej., 60 periodos mensuales ≈ 5 años)."""
-    A, M, RF = align_inputs(asset_ret.to_frame('a'), mkt_ret, rf)
-    a = (A['a'] - RF)
-    m = (M - RF)
-    def _beta_win(x):
-        y = x.iloc[:, 0]
-        x_ = sm.add_constant(x.iloc[:, 1])
-        if x_.shape[0] < 3:
-            return np.nan
-        try:
-            return sm.OLS(y, x_, missing='drop').fit().params.get('x', np.nan)
-        except Exception:
-            return np.nan
-    df = pd.concat([a, m], axis=1, keys=['y', 'x']).dropna()
-    return df.rolling(window).apply(lambda w: _beta_win(pd.DataFrame(w.reshape(-1,2), columns=['y','x'])), raw=True)
-
-# =============================
-# Retornos esperados vía CAPM
-# =============================
-
-def capm_expected_returns(betas: pd.Series, market_premium: float, rf: float) -> pd.Series:
-    """E[Ri] = rf + βi * (market_premium). market_premium = E[Rm] - rf."""
-    return rf + betas * market_premium
-
-# =============================
-# Reportes y gráficos
-# =============================
-
-def capm_report(assets_ret: pd.DataFrame, mkt_ret: pd.Series, rf: Optional[pd.Series | float] = 0.0,
-                market_premium: Optional[float] = None) -> Dict[str, pd.DataFrame | pd.Series]:
-    """Genera un pequeño paquete: resultados OLS, betas, expected returns (si se pasa market_premium)."""
-    results = fit_capm_all(assets_ret, mkt_ret, rf)
-    betas = results['beta']
-    out: Dict[str, pd.DataFrame | pd.Series] = {'results': results, 'betas': betas}
-    if market_premium is not None and isinstance(rf, (int, float)):
-        er = capm_expected_returns(betas, market_premium, float(rf))
-        out['expected_returns_capm'] = er
-    return out
-
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import plotly.express as px
 
-# =============================
-# Gráficos interactivos con Plotly
-# =============================
+try:
+    import yfinance as yf
+except:
+    pass
 
+def get_stock_prices(tickers, start_date, end_date):
+    data = yf.download(tickers, start=start_date, end=end_date, auto_adjust=False, progress=False)
+    if isinstance(data.columns, pd.MultiIndex):
+        prices = data['Adj Close'] if 'Adj Close' in data.columns.get_level_values(0) else data['Close']
+    else:
+        prices = data
+    return prices.dropna()
 
-def plot_combined_evolution(prices_df: pd.DataFrame, returns_df: pd.DataFrame, 
-                          main_title: str = "Análisis de Evolución") -> go.Figure:
-    """Grafica precios y rendimientos en subplots combinados"""
-    # Normalizar precios
-    prices = prices_df 
-    cumulative_returns = (1 + returns_df).cumprod() - 1
-    cumulative_returns *= 100  # Convertir a porcentaje
-    
-    fig = make_subplots(
-        rows=2, cols=1,
-        subplot_titles=('Evolución de Precios', 'Retornos Acumulados'),
-        vertical_spacing=0.15
+def calculate_returns(prices, return_type='simple'):
+    prices = prices.sort_index()
+    if return_type == 'Simple':
+        returns = prices.pct_change()
+    elif return_type == 'Log':
+        returns = np.log(prices).diff()
+    else:
+        raise ValueError("Usa 'Simpe' o 'Log' para el Tipo de Cálculo de Retornos")
+    return returns.dropna()
+
+def prepare_data(stock_returns, market_returns, risk_free_rate=0.0):
+    # Retonro de mercado
+    market_returns = pd.Series(market_returns).dropna()
+
+    # Retorno de acciones
+    common_dates = stock_returns.index.intersection(market_returns.index)
+    stocks_aligned = stock_returns.loc[common_dates]
+    market_aligned = market_returns.loc[common_dates]
+
+    # Tasa libre de riesgo — convertir anual a diaria
+    rf_daily = float(risk_free_rate) / (252)
+    rf_series = pd.Series(rf_daily, index=common_dates)
+
+    return stocks_aligned, market_aligned, rf_series
+
+class CAPMResults:
+    def __init__(self, alpha, beta, alpha_t, beta_t, r_squared, num_obs):
+        self.alpha = alpha
+        self.beta = beta
+        self.alpha_t = alpha_t
+        self.beta_t = beta_t
+        self.r2 = r_squared
+        self.n = num_obs
+
+def run_capm_regression(stock_excess_returns, market_excess_returns):
+    data = pd.DataFrame({'stock': stock_excess_returns, 'market': market_excess_returns}).dropna()
+    if data.empty:
+        raise ValueError("No hay datos suficientes para la regresión")
+    X = sm.add_constant(data['market'])
+    y = data['stock']
+    model = sm.OLS(y, X).fit()
+    return CAPMResults(
+        model.params['const'],
+        model.params['market'],
+        model.tvalues['const'],
+        model.tvalues['market'],
+        model.rsquared,
+        len(data)
     )
+
+def calculate_all_capm(stock_returns, market_returns, risk_free=0.0):
+    """
+    Calcula CAPM para múltiples acciones y devuelve resultados anualizados
+    """
+    stocks, market, rf = prepare_data(stock_returns, market_returns, risk_free)
+    market_excess = market - rf
     
-    # Gráfico de precios (arriba)
-    for i, column in enumerate(prices.columns):
-        fig.add_trace(
-            go.Scatter(
-                x=prices.index,
-                y=prices[column],
-                name=column,
-                mode='lines',
-                showlegend=True,
-                hovertemplate='<b>%{x}</b><br>Precio: %{y:.2f}<extra></extra>'
-            ),
-            row=1, col=1
-        )
+    results = []
     
-    # Gráfico de rendimientos (abajo)
-    for i, column in enumerate(cumulative_returns.columns):
-        fig.add_trace(
-            go.Scatter(
-                x=cumulative_returns.index,
-                y=cumulative_returns[column],
-                name=column,
-                mode='lines',
-                showlegend=False,
-                hovertemplate='<b>%{x}</b><br>Retorno: %{y:.2f}%<extra></extra>'
-            ),
-            row=2, col=1
-        )
+    for stock_name in stocks.columns:
+        stock_excess = stocks[stock_name] - rf
+        capm_result = run_capm_regression(stock_excess, market_excess)
+        
+        # Calcular retorno esperado usando CAPM (CORREGIDO)
+        market_premium_anual = market_excess.mean() * 252
+        expected_return = (rf.mean() * 252) + (capm_result.beta * market_premium_anual)
+        
+        # Alpha anualizado CORREGIDO - ya está en términos diarios, multiplicar por 252
+        alpha_anual = capm_result.alpha * 252
+        
+        results.append({
+            'Stock': stock_name,
+            'alpha': alpha_anual * 100,  # Convertir a porcentaje
+            'beta': capm_result.beta,
+            'R_squared': capm_result.r2 * 100,  # R² en porcentaje
+            'Observaciones': capm_result.n,
+            'Retorno_Esperado': expected_return * 100,  # Convertir a porcentaje
+            'T-Alpha': capm_result.alpha_t,
+            'T-Beta': capm_result.beta_t
+        })
     
-    fig.update_layout(
-        title=dict(text=main_title, x=0.5, xanchor='center', font=dict(size=20)),
-        height=700,
-        hovermode='x unified'
-    )
-    
+    return pd.DataFrame(results).set_index('Stock')
+
+def rolling_beta_analysis(stock_returns, market_returns, window=60, risk_free=0.0):
+    stocks, market, rf = prepare_data(stock_returns, market_returns, risk_free)
+    market_excess = market - rf
+    rolling_betas = {}
+    for stock in stocks.columns:
+        stock_excess = stocks[stock] - rf
+        betas = []
+        for i in range(window, len(stock_excess)):
+            stock_window = stock_excess.iloc[i - window:i]
+            market_window = market_excess.iloc[i - window:i]
+            if stock_window.isna().any() or market_window.isna().any():
+                betas.append(np.nan)
+                continue
+            X = sm.add_constant(market_window)
+            model = sm.OLS(stock_window, X).fit()
+            betas.append(model.params.iloc[1])  # En lugar de model.params[1]
+        dates = stock_excess.index[window:]
+        rolling_betas[stock] = pd.Series(betas, index=dates)
+    return rolling_betas
+
+def capm_expected_return(beta, market_return, risk_free_rate):
+    return risk_free_rate + beta * (market_return - risk_free_rate)
+
+def create_capm_report(stock_returns, market_returns, risk_free=0.0, expected_market_return=None):
+    capm_results = calculate_all_capm(stock_returns, market_returns, risk_free)
+    betas = capm_results['beta']
+    report = {'capm_results': capm_results, 'betas': betas}
+    if expected_market_return is not None and isinstance(risk_free, (int, float)):
+        expected_returns = betas.apply(lambda beta: capm_expected_return(beta, expected_market_return, risk_free))
+        report['expected_returns'] = expected_returns
+    return report
+
+def plot_stock_analysis(prices, returns, title="Análisis de Acciones"):
+    cumulative_returns = (1 + returns).cumprod() - 1
+    cumulative_returns *= 100
+    fig = make_subplots(rows=2, cols=1,
+                        subplot_titles=('Precios de las Acciones', 'Retornos Acumulados (%)'),
+                        vertical_spacing=0.2)
+    for stock in prices.columns:
+        fig.add_trace(go.Scatter(x=prices.index, y=prices[stock], name=stock, mode='lines'), row=1, col=1)
+    for stock in cumulative_returns.columns:
+        fig.add_trace(go.Scatter(x=cumulative_returns.index, y=cumulative_returns[stock], name=stock, mode='lines'),
+                      row=2, col=1)
+    fig.update_layout(title=title, height=600, hovermode='x unified')
     fig.update_xaxes(title_text="Fecha", row=2, col=1)
-    fig.update_yaxes(title_text="Precio de la Acción ($)", row=1, col=1)
+    fig.update_yaxes(title_text="Precio ($)", row=1, col=1)
     fig.update_yaxes(title_text="Retorno Acumulado (%)", row=2, col=1)
-    
+    return fig
+
+def plot_rolling_beta(rolling_betas_dict):
+    fig = go.Figure()
+    for stock, beta_series in rolling_betas_dict.items():
+        fig.add_trace(go.Scatter(x=beta_series.index, y=beta_series.values, mode='lines', name=stock))
+    fig.add_hline(y=1, line_dash="dot", line_color="gray",
+                  annotation_text="Beta = 1", annotation_position="bottom right")
+    fig.update_layout(title="Evolución de la Beta (Rolling)",
+                      xaxis_title="Fecha", yaxis_title="Beta",
+                      template="plotly_white", hovermode="x unified",
+                      height=450, legend=dict(orientation="h", y=-0.2, x=0.3), title_x=0.5)
     return fig
